@@ -23,7 +23,7 @@ from typing import Iterable, Optional
 import numpy as np
 import pandas as pd
 
-VERSION = "2026-09-02.7"
+VERSION = "2026-09-02.8"
 
 RAW_COLUMNS = ["code", "num_from", "num_to", "capacity", "operator", "region"]
 
@@ -168,6 +168,51 @@ def parse_phone(raw) -> Optional[tuple[str, str, str]]:
 def normalize_phone(raw) -> Optional[str]:
     parsed = parse_phone(raw)
     return parsed[0] if parsed else None
+
+
+# Символы, которые могут встречаться внутри записи номера: пробелы (включая
+# неразрывный), дефисы всех начертаний, скобки, точки.
+_PHONE_CHARS = r"\d\s\u00a0\-\u2010-\u2015\(\)\."
+PHONE_RUN_RE = re.compile(rf"[+\d][{_PHONE_CHARS}]{{7,}}\d")
+
+
+def _split_digits(digits: str) -> list[str]:
+    """Разбивает слипшуюся цепочку цифр на отдельные номера."""
+    if len(digits) <= 11:
+        return [digits]
+
+    chunks, i = [], 0
+    while len(digits) - i >= 10:
+        take = 11 if digits[i] in "78" and len(digits) - i >= 11 else 10
+        chunks.append(digits[i:i + take])
+        i += take
+    return chunks
+
+
+def extract_phones(text: str) -> list[str]:
+    """
+    Вытаскивает номера из произвольного текста.
+
+    Понимает списки в столбик, через запятую, с пробелами и скобками, а также
+    ссылки из CRM вида +[7 902 112-93-38](callto://+79021129338) — там номер
+    записан дважды, в результат он попадёт один раз.
+    """
+    seen: set = set()
+    found: list[str] = []
+
+    for line in (text or "").splitlines():
+        for run in PHONE_RUN_RE.findall(line):
+            digits = re.sub(r"\D", "", run)
+            for chunk in _split_digits(digits):
+                if len(chunk) < 10:
+                    continue
+                key = normalize_phone(chunk) or chunk
+                if key in seen:
+                    continue
+                seen.add(key)
+                found.append(chunk)
+
+    return found
 
 
 def number_kind(code: str) -> str:

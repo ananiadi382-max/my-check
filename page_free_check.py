@@ -14,7 +14,7 @@ import streamlit as st
 
 from numbering_plan import (
     CATEGORY_LABELS, KIND_LABELS, PREPARED_NAME, REGISTRY_BASENAMES,
-    build_registry, find_registry_files, lookup_many,
+    build_registry, extract_phones, find_registry_files, lookup_many,
 )
 
 REGISTRY_DIR = "data"
@@ -46,10 +46,6 @@ def _load_uploaded_cached(payloads: tuple, cache_key: str):
     return build_registry(payloads)
 
 
-def _extract_phones(text: str) -> list[str]:
-    return [chunk for chunk in re.split(r"[\s,;]+", text or "") if chunk.strip()]
-
-
 def _phones_from_file(uploaded) -> list[str]:
     name = uploaded.name.lower()
     if name.endswith((".xlsx", ".xls")):
@@ -59,7 +55,8 @@ def _phones_from_file(uploaded) -> list[str]:
     if df.empty:
         return []
     column = st.selectbox("Колонка с номерами", options=list(df.columns))
-    return df[column].dropna().astype(str).tolist()
+    cells = df[column].dropna().astype(str)
+    return extract_phones("\n".join(cells))
 
 
 def build_display(results: pd.DataFrame) -> pd.DataFrame:
@@ -188,11 +185,13 @@ def render() -> None:
 
     if mode == "Список":
         text = st.text_area(
-            "Номера — по одному в строке или через запятую",
+            "Номера — в столбик, через запятую или как скопировалось из CRM",
             height=140,
-            placeholder="79144671546\n84954809630",
+            placeholder="79144671546\n8 (495) 480-96-30\n+[7 902 112-93-38](callto://+79021129338)",
         )
-        phones = _extract_phones(text)
+        phones = extract_phones(text)
+        if text.strip() and not phones:
+            st.warning("В тексте не нашлось ни одного номера — проверьте, что скопировалось.")
     else:
         uploaded = st.file_uploader(
             "Excel или CSV", type=["xlsx", "xls", "csv"], key="phones_upload"
@@ -203,7 +202,7 @@ def render() -> None:
     if not phones:
         return
 
-    st.write(f"Номеров к проверке: {len(phones)}")
+    st.write(f"Распознано номеров: {len(phones)} (повторы отброшены)")
 
     if not st.button("Проверить по реестру", type="primary"):
         return
