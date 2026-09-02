@@ -23,7 +23,7 @@ from typing import Iterable, Optional
 import numpy as np
 import pandas as pd
 
-VERSION = "2026-09-02.5"
+VERSION = "2026-09-02.6"
 
 RAW_COLUMNS = ["code", "num_from", "num_to", "capacity", "operator", "region"]
 
@@ -216,10 +216,28 @@ def _decode(raw: bytes) -> str:
 
 
 def _detect_separator(text: str) -> str:
-    head = "\n".join(text.splitlines()[:20])
-    counts = {sep: head.count(sep) for sep in SEPARATORS}
-    best = max(counts, key=counts.get)
-    return best if counts[best] > 0 else ";"
+    """
+    Подбирает разделитель по структуре, а не по количеству символов.
+
+    Считать вхождения нельзя: в выписке ABC-8xx поле территории содержит
+    перечисления регионов через запятую, и запятых в файле больше, чем
+    точек с запятой. Поэтому берём первый разделитель, при котором КАЖДАЯ
+    строка распадается минимум на шесть полей.
+    """
+    lines = [ln for ln in text.splitlines()[:50] if ln.strip()]
+    if not lines:
+        return ";"
+
+    for sep in SEPARATORS:
+        if min(line.count(sep) + 1 for line in lines) >= 6:
+            return sep
+
+    # Ни один не дал шести полей во всех строках — берём тот,
+    # что даёт больше всего полей в типичной строке.
+    widths = {sep: sorted(line.count(sep) + 1 for line in lines)[len(lines) // 2]
+              for sep in SEPARATORS}
+    best = max(widths, key=widths.get)
+    return best if widths[best] > 1 else ";"
 
 
 def _looks_like_html(raw: bytes) -> bool:
@@ -255,7 +273,7 @@ def load_def_plan(source) -> pd.DataFrame:
 
         # Шапку не разбираем: она у разных выписок отличается числом полей.
         # Строка заголовка отсеется сама — в ней "От" не превращается в число.
-        head_lines = [ln for ln in text.splitlines()[:20] if ln.strip()]
+        head_lines = [ln for ln in text.splitlines()[:50] if ln.strip()]
         widest = max((ln.count(separator) + 1 for ln in head_lines), default=0)
         if widest < 6:
             raise ValueError(
