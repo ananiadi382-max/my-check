@@ -23,7 +23,7 @@ from typing import Iterable, Optional
 import numpy as np
 import pandas as pd
 
-VERSION = "2026-09-02.6"
+VERSION = "2026-09-02.7"
 
 RAW_COLUMNS = ["code", "num_from", "num_to", "capacity", "operator", "region"]
 
@@ -116,9 +116,14 @@ class Registry:
     def __len__(self) -> int:
         return len(self.ranges)
 
+    @property
+    def groups(self) -> set:
+        """Первые цифры кодов — какие файлы реестра фактически загружены."""
+        return {code[0] for code in self.codes}
+
     def covers(self, code: str) -> bool:
         """Загружен ли файл, в котором вообще может быть этот код."""
-        return code in self.codes
+        return bool(code) and code[0] in self.groups
 
 
 @dataclass
@@ -166,11 +171,18 @@ def normalize_phone(raw) -> Optional[str]:
 
 
 def number_kind(code: str) -> str:
+    """
+    Тип номера по коду.
+
+    Внимание: на "8" начинаются коды многих городов — 812 Санкт-Петербург,
+    843 Казань, 8362 Йошкар-Ола. Сервисные коды только трёхзначные из
+    блока 800-809, всё остальное географическое.
+    """
     if code.startswith("9"):
         return "mobile"
     if code == "800":
         return "toll_free"
-    if code.startswith("8"):
+    if len(code) == 3 and code.startswith("80"):
         return "service"
     return "geo"
 
@@ -299,8 +311,19 @@ def load_def_plan(source) -> pd.DataFrame:
     df = df[code_num.notna()].copy()
     code_num = code_num[code_num.notna()].astype("int64")
 
-    df["start_key"] = code_num * 10_000_000 + df["num_from"].astype("int64")
-    df["end_key"] = code_num * 10_000_000 + df["num_to"].astype("int64")
+    # Национальный номер всегда 10 цифр: код + абонентский номер.
+    # Код бывает трёх- (495), четырёх- (8362) и пятизначным, поэтому
+    # ширину абонентской части считаем от длины кода, а не фиксируем.
+    width = 10 - df["code"].str.len()
+    valid = (width >= 4) & (width <= 8)
+    df, code_num, width = df[valid].copy(), code_num[valid], width[valid]
+
+    multiplier = np.power(10, width.to_numpy(), dtype="int64")
+    df["start_key"] = code_num.to_numpy() * multiplier + df["num_from"].astype("int64").to_numpy()
+    df["end_key"] = code_num.to_numpy() * multiplier + df["num_to"].astype("int64").to_numpy()
+
+    # Отсекаем строки, где абонентская часть не влезает в свою разрядность.
+    df = df[(df["start_key"] >= 10**9) & (df["end_key"] < 10**10)]
 
     if df.empty:
         raise ValueError(
@@ -427,53 +450,50 @@ def lookup(phone_raw, registry: Registry) -> LookupResult:
             note="Не похоже на телефонный номер РФ — проверьте, как он записан в карточке лида.",
         )
 
-    phone, code, _ = parsed
-    kind = number_kind(code)
+    phone, prefix, _ = parsed          # prefix — первые три цифры, ещё не код
+    national = int(phone[1:])          # 10 цифр: код + абонентский номер
 
-    if kind in ("toll_free", "service"):
-        category, risk, note = _classify_service(kind)
-        result = LookupResult(
-            phone=phone, found=False, kind=kind, code=code,
-            category=category, risk=risk, note=note,
-        )
-    else:
-        result = None
-
-    key = int(code) * 10_000_000 + int(phone[4:])
     starts = registry.ranges["start_key"].to_numpy()
-    idx = int(np.searchsorted(starts, key, side="right")) - 1
-    hit = idx >= 0 and key <= int(registry.ranges["end_key"].iat[idx])
+    idx = int(np.searchsorted(starts, national, side="right")) - 1
+    hit = idx >= 0 and national <= int(registry.ranges["end_key"].iat[idx])
 
     if hit:
         row = registry.ranges.iloc[idx]
+        code = str(row["code"])                 # настоящий код: 495, 8362, ...
+        kind = number_kind(code)
         capacity = None if pd.isna(row["capacity"]) else int(row["capacity"])
-        if result is not None:
-            # сервисный номер: подтягиваем оператора, но вердикт оставляем свой
-            result.found = True
-            result.operator = row["operator"]
-            result.region = row["region"]
-            result.capacity = capacity
-            return result
-        classifier = _classify_mobile if kind == "mobile" else _classify_geo
-        category, risk, note = classifier(row["operator"], row["capacity"])
+
+        if kind in ("toll_free", "service"):
+            category, risk, note = _classify_service(kind)
+        else:
+            classifier = _classify_mobile if kind == "mobile" else _classify_geo
+            category, risk, note = classifier(row["operator"], row["capacity"])
+
         return LookupResult(
             phone=phone, found=True, kind=kind, code=code,
             operator=row["operator"], region=row["region"], capacity=capacity,
             category=category, risk=risk, note=note,
         )
 
-    if result is not None:
-        return result
+    # Не нашли: код определить не по чему, судим по первым трём цифрам.
+    kind = number_kind(prefix)
 
-    if not registry.covers(code):
+    if kind in ("toll_free", "service"):
+        category, risk, note = _classify_service(kind)
         return LookupResult(
-            phone=phone, found=False, kind=kind, code=code,
+            phone=phone, found=False, kind=kind, code=prefix,
+            category=category, risk=risk, note=note,
+        )
+
+    if not registry.covers(prefix):
+        return LookupResult(
+            phone=phone, found=False, kind=kind, code=prefix,
             category="not_covered", risk="unknown",
-            note=f"Проверить не удалось: не загружен файл реестра с кодом {code}.",
+            note=f"Проверить не удалось: не загружен файл реестра с кодами на {prefix[0]}.",
         )
 
     return LookupResult(
-        phone=phone, found=False, kind=kind, code=code,
+        phone=phone, found=False, kind=kind, code=prefix,
         category="unknown_range", risk="suspicious",
         note="Номер не входит ни в один диапазон, выделенный операторам. "
              "Скорее всего выдуман или записан с ошибкой.",
