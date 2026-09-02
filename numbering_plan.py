@@ -13,6 +13,7 @@ CSV (cp1251 или UTF-8) и XLSX. Разделитель в CSV тоже опр
 
 from __future__ import annotations
 
+import gzip
 import io
 import os
 import re
@@ -22,7 +23,7 @@ from typing import Iterable, Optional
 import numpy as np
 import pandas as pd
 
-VERSION = "2026-09-02.4"
+VERSION = "2026-09-02.5"
 
 RAW_COLUMNS = ["code", "num_from", "num_to", "capacity", "operator", "region"]
 
@@ -34,7 +35,11 @@ XLS_SIGNATURE = b"\xd0\xcf\x11\xe0"     # старый бинарный форм
 
 # Имена файлов реестра, которые ищем в папке data/ (в любом из двух форматов).
 REGISTRY_BASENAMES = ("DEF-9xx", "ABC-3xx", "ABC-4xx", "ABC-8xx")
-REGISTRY_EXTENSIONS = (".xlsx", ".csv")
+REGISTRY_EXTENSIONS = (".csv.gz", ".xlsx", ".csv")
+
+# Один сжатый файл со всеми четырьмя выписками — его и кладём в репозиторий.
+# Создаётся скриптом prepare_registry.py.
+PREPARED_NAME = "registry.csv.gz"
 
 # --- Классификация операторов -------------------------------------------------
 #
@@ -172,16 +177,25 @@ def number_kind(code: str) -> str:
 
 # --- Чтение файлов ------------------------------------------------------------
 
+GZIP_SIGNATURE = b"\x1f\x8b"
+
+
 def _read_bytes(source) -> bytes:
+    """Читает путь, файловый объект или bytes. Gzip распаковывается прозрачно."""
     if isinstance(source, bytes):
-        return source
-    if hasattr(source, "read"):
+        raw = source
+    elif hasattr(source, "read"):
         if hasattr(source, "seek"):
             source.seek(0)
         data = source.read()
-        return data.encode("utf-8") if isinstance(data, str) else data
-    with open(source, "rb") as fh:
-        return fh.read()
+        raw = data.encode("utf-8") if isinstance(data, str) else data
+    else:
+        with open(source, "rb") as fh:
+            raw = fh.read()
+
+    if raw.startswith(GZIP_SIGNATURE):
+        raw = gzip.decompress(raw)
+    return raw
 
 
 def _decode(raw: bytes) -> str:
@@ -280,7 +294,16 @@ def load_def_plan(source) -> pd.DataFrame:
 
 
 def find_registry_files(directory: str = "data") -> list[str]:
-    """Возвращает пути ко всем найденным файлам реестра в папке."""
+    """
+    Возвращает пути к файлам реестра в папке.
+
+    Если есть подготовленный registry.csv.gz — используется только он.
+    Иначе собираем всё, что нашлось из сырых выписок.
+    """
+    prepared = os.path.join(directory, PREPARED_NAME)
+    if os.path.exists(prepared):
+        return [prepared]
+
     found = []
     for base in REGISTRY_BASENAMES:
         for ext in REGISTRY_EXTENSIONS:
@@ -289,6 +312,12 @@ def find_registry_files(directory: str = "data") -> list[str]:
                 found.append(path)
                 break
     return found
+
+
+def load_registry(directory: str = "data") -> Optional[Registry]:
+    """Собирает Registry из папки. Возвращает None, если файлов нет."""
+    paths = find_registry_files(directory)
+    return build_registry(paths) if paths else None
 
 
 def build_registry(sources: Iterable) -> Registry:
