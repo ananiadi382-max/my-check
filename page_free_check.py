@@ -13,7 +13,7 @@ import pandas as pd
 import streamlit as st
 
 from numbering_plan import (
-    CATEGORY_LABELS, KIND_LABELS, REGISTRY_BASENAMES,
+    CATEGORY_LABELS, KIND_LABELS, PREPARED_NAME, REGISTRY_BASENAMES,
     build_registry, find_registry_files, lookup_many,
 )
 
@@ -89,31 +89,48 @@ def _style(display: pd.DataFrame):
     return display.style.apply(color, axis=1).hide(axis="columns", subset=["risk"])
 
 
+def _report_gaps(registry, paths) -> None:
+    """Показывает, какие файлы не прочитались и каких не хватает."""
+    for name, reason in registry.errors:
+        st.error(f"Файл {name} прочитать не удалось: {reason}")
+
+    if paths and PREPARED_NAME not in registry.sources:
+        ok = set(registry.sources)
+        missing = [
+            base for base in REGISTRY_BASENAMES
+            if not any(p.startswith(base) for p in ok)
+        ]
+        if missing:
+            st.warning(
+                "Нет данных по файлам: " + ", ".join(missing) + ". "
+                "Номера с этими кодами получат вердикт «Не проверен». "
+                "Скачать заново: opendata.digital.gov.ru/registry/numeric/"
+            )
+
+
 def _registry_section():
     """Загружает реестр из data/ или через форму. Возвращает Registry или None."""
     paths = find_registry_files(REGISTRY_DIR)
 
     if paths:
         key = "|".join(f"{p}:{os.path.getmtime(p)}" for p in paths)
-        registry = _load_registry_cached(tuple(paths), key)
-        loaded = ", ".join(os.path.basename(p) for p in paths)
+        try:
+            registry = _load_registry_cached(tuple(paths), key)
+        except ValueError as exc:
+            st.error(str(exc))
+            return None
+
         st.success(
-            f"Загружено {len(registry):,} диапазонов из файлов: {loaded}".replace(",", " ")
+            f"Загружено {len(registry):,} диапазонов из файлов: "
+            f"{', '.join(registry.sources)}".replace(",", " ", 1)
         )
-        missing = [b for b in REGISTRY_BASENAMES
-                   if not any(os.path.basename(p).startswith(b) for p in paths)]
-        if missing:
-            st.warning(
-                "Не найдены файлы: " + ", ".join(missing) + ". "
-                "Номера с этими кодами получат вердикт «Не проверен». "
-                "Скачать можно на opendata.digital.gov.ru/registry/numeric/"
-            )
+        _report_gaps(registry, paths)
         return registry
 
     st.warning(
-        f"В папке {REGISTRY_DIR}/ нет файлов реестра. Положите туда "
-        "DEF-9xx (мобильные), ABC-3xx и ABC-4xx (городские), ABC-8xx (8-800) "
-        "в формате csv или xlsx — либо загрузите вручную."
+        f"В папке {REGISTRY_DIR}/ нет файлов реестра. Положите туда либо "
+        f"подготовленный {PREPARED_NAME}, либо сырые выписки DEF-9xx, "
+        "ABC-3xx, ABC-4xx и ABC-8xx — либо загрузите их вручную."
     )
     uploads = st.file_uploader(
         "Файлы реестра", type=["xlsx", "xls", "csv"],
@@ -123,8 +140,14 @@ def _registry_section():
         return None
 
     payloads = tuple(u.getvalue() for u in uploads)
-    registry = _load_uploaded_cached(payloads, f"upload:{sum(len(p) for p in payloads)}")
+    try:
+        registry = _load_uploaded_cached(payloads, f"upload:{sum(len(p) for p in payloads)}")
+    except ValueError as exc:
+        st.error(str(exc))
+        return None
+
     st.success(f"Загружено {len(registry):,} диапазонов".replace(",", " "))
+    _report_gaps(registry, [])
     return registry
 
 
